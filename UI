@@ -1,0 +1,725 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 24 13:03:52 2025
+
+@author: user
+"""
+
+import tkinter as tk
+from tkinter import font, messagebox, simpledialog
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import re
+import msoffcrypto
+import io
+
+def read_encrypted_excel(file_path, file_desc):
+    pw_root = tk.Tk()
+    pw_root.title(f"{file_desc} file")
+    pw_root.geometry("400x180")
+    pw_root.resizable(False, False)
+
+    tk.Label(pw_root, text=f"Enter password：",
+             font=("Arial", 12, "bold")).pack(pady=(20, 10))
+    pw_var = tk.StringVar()
+    entry = tk.Entry(pw_root, textvariable=pw_var, show="*", font=("Arial", 12))
+    entry.pack(padx=20, fill="x")
+    entry.focus()
+
+    def on_ok(event=None):
+        pw_root.quit()
+    def on_cancel():
+        pw_var.set("")
+        pw_root.quit()
+
+    entry.bind("<Return>", on_ok)
+    pw_root.bind("<Return>", on_ok)  
+
+    btn_frame = tk.Frame(pw_root)
+    btn_frame.pack(pady=20)
+    tk.Button(btn_frame, text="Ok", width=10, command=on_ok).pack(side="left", padx=10)
+    tk.Button(btn_frame, text="Cancel", width=10, command=on_cancel).pack(side="left")
+
+    pw_root.mainloop()
+    password = pw_var.get()
+    pw_root.destroy()
+
+    if not password:
+        messagebox.showerror("錯誤", "您沒有輸入密碼，程式將終止。")
+        exit()
+
+    try:
+        with open(file_path, "rb") as f:
+            office_file = msoffcrypto.OfficeFile(f)
+            office_file.load_key(password=password)
+            decrypted = io.BytesIO()
+            office_file.decrypt(decrypted)
+    except Exception as e:
+        messagebox.showerror("解密失敗", f"{file_desc} 解密失敗：{e}")
+        exit()
+
+    decrypted.seek(0)
+    df = pd.read_excel(decrypted)
+    return df
+
+recipes_table = read_encrypted_excel("C://Users//user//Desktop//生成式AI//UI//recipes.xlsx", "recipes")
+release_table = read_encrypted_excel("C://Users//user//Desktop//生成式AI//UI//release.xlsx", "release")
+
+recipes = recipes_table.to_numpy()
+release = release_table.to_numpy()
+
+no_of_product_types = np.max(recipes[:, 0])
+no_of_steps = np.sum(recipes[:, 0] == 1)
+no_of_machines = recipes.shape[1] - 1
+no_of_jobs = release.shape[0]
+product_type = release[:, 1]
+release_time = release[:, 2]
+due_date = release[:, 3]
+
+processing_time = np.zeros((no_of_jobs, no_of_steps, no_of_machines))
+for k in range(no_of_jobs):
+    for p in range(no_of_steps):
+        for q in range(no_of_machines):
+            processing_time[k, p, q] = recipes[(product_type[k] - 1) * no_of_product_types + p, q + 1]
+
+max_iterations = 2000     
+tabu_tenure = 15          
+num_neighbors_swap = 5    
+num_neighbors_machine = 5
+
+user_constraints = [] 
+job_order_constraints = []
+
+def enforce_user_constraint(sol):
+    global user_constraints
+    if user_constraints:
+        for (job_c, op_c, machine_c) in user_constraints:
+            for i in range(len(sol)):
+                if sol[i, 0] == job_c and sol[i, 1] == op_c:
+                    sol[i, 2] = machine_c
+    return sol
+
+def repair_solution(sol):
+    sol_list = list(sol)
+    job_indices = {j: [] for j in range(1, no_of_jobs+1)}
+    for idx, op in enumerate(sol_list):
+        job_indices[op[0]].append(idx)
+        
+    for (job_a, relation, job_b) in job_order_constraints:
+        if job_indices[job_a] and job_indices[job_b]:
+            if relation == "earlier":
+                if job_indices[job_a][-1] > job_indices[job_b][0]:
+
+                    block = [op for op in sol_list if op[0] == job_a]
+                    sol_list = [op for op in sol_list if op[0] != job_a]
+                    insert_index = job_indices[job_b][0]
+                    for op in reversed(block):
+                        sol_list.insert(insert_index, op)
+                    job_indices = {j: [] for j in range(1, no_of_jobs+1)}
+                    for idx, op in enumerate(sol_list):
+                        job_indices[op[0]].append(idx)
+            elif relation == "later":
+                if job_indices[job_a][0] < job_indices[job_b][-1]:
+                    block = [op for op in sol_list if op[0] == job_a]
+                    sol_list = [op for op in sol_list if op[0] != job_a]
+                    insert_index = job_indices[job_b][-1] + 1
+                    for op in block:
+                        sol_list.insert(insert_index, op)
+                        insert_index += 1
+                    job_indices = {j: [] for j in range(1, no_of_jobs+1)}
+                    for idx, op in enumerate(sol_list):
+                        job_indices[op[0]].append(idx)
+    return np.array(sol_list)
+
+def generate_initial_solution():
+    max_attempts = 10000
+    candidate = None
+    for attempt in range(max_attempts):
+        solution = np.zeros((no_of_jobs * no_of_steps, 3), dtype=int)
+        scheduled = np.zeros((no_of_jobs, no_of_steps), dtype=int)
+        count = 0
+        while count < no_of_jobs * no_of_steps:
+            job = np.random.randint(1, no_of_jobs + 1)
+            step = np.random.randint(1, no_of_steps + 1)
+            machine = np.random.randint(1, no_of_machines + 1)
+            if scheduled[job - 1, step - 1] == 0:
+                if step > 1:
+                    if scheduled[job - 1, step - 2] > 0:
+                        solution[count] = [job, step, machine]
+                        scheduled[job - 1, step - 1] = 1
+                        count += 1
+                else:
+                    solution[count] = [job, step, machine]
+                    scheduled[job - 1, step - 1] = 1
+                    count += 1
+        solution = enforce_user_constraint(solution)
+        if is_feasible(solution):
+            return solution
+        candidate = solution
+    repaired = repair_solution(candidate)
+    if is_feasible(repaired):
+        return repaired
+    else:
+        return repaired
+
+def evaluate_solution(sol):
+    at = np.zeros(no_of_machines) 
+    st = np.zeros((no_of_jobs, no_of_steps)) 
+    ct = np.zeros((no_of_jobs, no_of_steps)) 
+    for op in sol:
+        job, step, machine = op
+        if step == 1:
+            st[job - 1, step - 1] = max(release_time[job - 1], at[machine - 1])
+        else:
+            st[job - 1, step - 1] = max(ct[job - 1, step - 2], at[machine - 1])
+        ct[job - 1, step - 1] = st[job - 1, step - 1] + processing_time[job - 1, step - 1, machine - 1]
+        at[machine - 1] = ct[job - 1, step - 1]
+    cmax = np.max(ct)
+    cavg = np.mean(np.max(ct, axis=1))
+    tardiness = np.sum(np.maximum(ct[:, no_of_steps - 1] - due_date, 0))
+    max_lateness = np.max(ct[:, no_of_steps - 1] - due_date)
+    return {'st': st, 'ct': ct, 'cmax': cmax, 'cavg': cavg, 'tardiness': tardiness, 'max_lateness': max_lateness}
+
+def is_feasible(sol):
+    job_steps = {j: [] for j in range(1, no_of_jobs + 1)}
+    for op in sol:
+        job, step, machine = op
+        job_steps[job].append(step)
+    for steps in job_steps.values():
+        if steps != sorted(steps):
+            return False
+    if user_constraints:
+        for (job_c, op_c, machine_c) in user_constraints:
+            found = False
+            for op in sol:
+                if op[0] == job_c and op[1] == op_c:
+                    found = True
+                    if op[2] != machine_c:
+                        return False
+            if not found:
+                return False
+
+    if job_order_constraints:
+        sol_eval = evaluate_solution(sol)
+        ct = sol_eval['ct']
+        for (job_a, relation, job_b) in job_order_constraints:
+            if relation == "earlier":
+                if ct[job_a - 1, no_of_steps - 1] >= ct[job_b - 1, no_of_steps - 1]:
+                    return False
+            elif relation == "later":
+                if ct[job_a - 1, no_of_steps - 1] <= ct[job_b - 1, no_of_steps - 1]:
+                    return False
+    return True
+
+def update_tabu_list(tabu_list):
+    keys_to_remove = []
+    for move in list(tabu_list.keys()):
+        tabu_list[move] -= 1
+        if tabu_list[move] <= 0:
+            keys_to_remove.append(move)
+    for move in keys_to_remove:
+        del tabu_list[move]
+    return tabu_list
+
+def generate_swap_neighbor(sol):
+    neighbor = sol.copy()
+    idx1 = np.random.randint(0, len(sol))
+    idx2 = np.random.randint(0, len(sol))
+    # 保證交換的操作屬於不同的工作
+    while sol[idx1, 0] == sol[idx2, 0]:
+        idx2 = np.random.randint(0, len(sol))
+    neighbor[[idx1, idx2]] = neighbor[[idx2, idx1]]
+    move = ("swap", min(idx1, idx2), max(idx1, idx2), sol[idx1, 0], sol[idx2, 0])
+    return neighbor, move
+
+def generate_machine_neighbor(sol):
+    neighbor = sol.copy()
+    idx = np.random.randint(0, len(sol))
+    current_machine = neighbor[idx, 2]
+    new_machine = np.random.randint(1, no_of_machines + 1)
+    while new_machine == current_machine:
+        new_machine = np.random.randint(1, no_of_machines + 1)
+    neighbor[idx, 2] = new_machine
+    move = ("machine", idx, current_machine, new_machine)
+    return neighbor, move
+
+def run_tabu_search():
+    current_solution = generate_initial_solution()
+    current_eval = evaluate_solution(current_solution)
+    current_obj = current_eval['cmax']
+    best_solution = current_solution.copy()
+    best_eval = current_eval
+    best_obj = current_obj
+
+    iterations = max_iterations
+    cmax_array = np.zeros(iterations)
+    cavg_array = np.zeros(iterations)
+    best_so_far_array = np.zeros(iterations)
+
+    total_tardiness_array = np.zeros(iterations)
+    max_lateness_array = np.zeros(iterations)
+    st_all = np.zeros((iterations, no_of_jobs, no_of_steps))
+    ct_all = np.zeros((iterations, no_of_jobs, no_of_steps))
+    machine_all = np.zeros((iterations, no_of_jobs, no_of_steps), dtype=int)
+
+    tabu_list = {}
+
+    for t in range(iterations):
+        neighborhood = []
+        neighbor_moves = []
+        neighbor_evals = []
+
+        for i in range(num_neighbors_swap):
+            neighbor, move = generate_swap_neighbor(current_solution)
+            neighbor = enforce_user_constraint(neighbor)
+            if not is_feasible(neighbor):
+                continue
+            eval_neighbor = evaluate_solution(neighbor)
+            obj_neighbor = eval_neighbor['cmax']
+            if move in tabu_list and obj_neighbor >= best_obj:
+                continue
+            neighborhood.append(neighbor)
+            neighbor_moves.append(move)
+            neighbor_evals.append(eval_neighbor)
+            
+        for i in range(num_neighbors_machine):
+            neighbor, move = generate_machine_neighbor(current_solution)
+            neighbor = enforce_user_constraint(neighbor)
+            if not is_feasible(neighbor):
+                continue
+            eval_neighbor = evaluate_solution(neighbor)
+            obj_neighbor = eval_neighbor['cmax']
+            if move in tabu_list and obj_neighbor >= best_obj:
+                continue
+            neighborhood.append(neighbor)
+            neighbor_moves.append(move)
+            neighbor_evals.append(eval_neighbor)
+        
+        if len(neighborhood) == 0:
+            neighbor, move = generate_swap_neighbor(current_solution)
+            neighbor = enforce_user_constraint(neighbor)
+            if not is_feasible(neighbor):
+                neighbor = generate_initial_solution()
+                move = None
+            eval_neighbor = evaluate_solution(neighbor)
+            neighborhood.append(neighbor)
+            neighbor_moves.append(move)
+            neighbor_evals.append(eval_neighbor)
+        
+        candidate_cmax_values = [ev['cmax'] for ev in neighbor_evals]
+        iteration_min = np.min(candidate_cmax_values)
+        iteration_avg = np.mean(candidate_cmax_values)
+        cmax_array[t] = iteration_min
+        cavg_array[t] = iteration_avg
+
+        best_neighbor_idx = np.argmin(candidate_cmax_values)
+        best_neighbor = neighborhood[best_neighbor_idx]
+        best_neighbor_eval = neighbor_evals[best_neighbor_idx]
+        best_neighbor_obj = best_neighbor_eval['cmax']
+        best_move = neighbor_moves[best_neighbor_idx]
+        
+        if best_move is not None:
+            tabu_list[best_move] = tabu_tenure  
+        
+        current_solution = best_neighbor.copy()
+        current_eval = best_neighbor_eval
+        current_obj = best_neighbor_obj
+        
+        if current_obj < best_obj and is_feasible(current_solution):
+            best_solution = current_solution.copy()
+            best_eval = current_eval
+            best_obj = current_obj
+        
+        best_so_far_array[t] = best_obj
+
+        total_tardiness_array[t] = current_eval['tardiness']
+        max_lateness_array[t] = current_eval['max_lateness']
+        st_all[t, :, :] = current_eval['st']
+        ct_all[t, :, :] = current_eval['ct']
+        
+        mach = np.zeros((no_of_jobs, no_of_steps), dtype=int)
+        for op in current_solution:
+            job, step, machine = op
+            mach[job - 1, step - 1] = machine
+        machine_all[t, :, :] = mach
+        
+        tabu_list = update_tabu_list(tabu_list)
+    
+    best_iter = np.argmin(cmax_array)
+    return {
+        'best_solution': best_solution,
+        'best_eval': best_eval,
+        'best_obj': best_obj,
+        'tardiness': best_eval['tardiness'],
+        'max_lateness': best_eval['max_lateness'],
+        'st_all': st_all,
+        'ct_all': ct_all,
+        'machine_all': machine_all,
+        'best_iter': best_iter,
+        'cmax_array': cmax_array,
+        'cavg_array': cavg_array,
+        'best_so_far_array': best_so_far_array
+    }
+
+def display_combined_chart(window, search_result):
+    best_iter = search_result['best_iter']
+    best_obj = search_result['best_obj']
+    st_all = search_result['st_all']
+    ct_all = search_result['ct_all']
+    machine_all = search_result['machine_all']
+    cmax_array = search_result['cmax_array']
+    cavg_array = search_result['cavg_array']
+    best_so_far_array = search_result['best_so_far_array']
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    ax1.plot(cmax_array, label="Min(Cmax)")
+    ax1.plot(cavg_array, label="Avg(Cmax)")
+
+    ax1.set_xlabel("Iterations")
+    ax1.set_ylabel("Cmax")
+    ax1.legend()
+    ax1.set_title("Performance Metrics Over Iterations")
+    
+    ax2.set_ylim(0, no_of_machines + 1)
+    ax2.set_xlim(0, best_obj)
+    ax2.set_ylabel('Machines')
+    ax2.set_xlabel('Time')
+    ax2.set_yticks(np.arange(1, no_of_machines + 1, 1))
+    colors = plt.cm.get_cmap('tab20', no_of_jobs)
+    for job in range(no_of_jobs):
+        for step in range(no_of_steps):
+            machine = int(machine_all[best_iter, job, step]) - 1
+            start_time = st_all[best_iter, job, step]
+            completion_time = ct_all[best_iter, job, step]
+            ax2.broken_barh([(start_time, completion_time - start_time)], (machine + 0.5, 0.8), facecolors=colors(job))
+    legend_handles = [mpatches.Patch(color=colors(i), label=f'Job {i+1}') for i in range(no_of_jobs)]
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left')
+    step_size = 5
+    ax2.set_xticks(np.arange(0, best_obj + 1, step_size))
+    ax2.set_title(f"Gantt Chart for Best Schedule (Cmax = {best_obj})")
+    
+    fig.tight_layout(pad=3.0)
+    
+    canvas = FigureCanvasTkAgg(fig, master=window)
+    canvas.draw()
+    widget = canvas.get_tk_widget()
+    widget.config(width=1000, height=800)
+    widget.pack(side=tk.TOP, padx=10, pady=10)
+
+def show_results(result_message, search_result):
+    result_window = tk.Toplevel(window)
+    result_window.title("Results")
+    result_window.geometry("950x1000")
+    
+    results_font = font.Font(family="Arial", size=11, weight="bold")
+    tk.Label(result_window, text="", justify=tk.LEFT).pack(pady=(5, 0))
+    for line in result_message.split('\n'):
+        if line.strip():
+            result_label = tk.Label(result_window, text=line, justify=tk.LEFT, font=results_font)
+            result_label.pack(pady=(1, 1))
+            tk.Label(result_window, text="").pack()
+    
+    display_combined_chart(result_window, search_result)
+
+def display_final_schedule_table(search_result):
+    best_solution = search_result['best_solution']
+    best_eval = search_result['best_eval']
+    def build_job_table_data(job_indices):
+        data = []
+        for j in job_indices:
+            data.append([f"Job #{j+1}", "", "", ""])
+            data.append(["Operation #", "Start Time", "End Time", "Machine #"])
+            for s in range(no_of_steps):
+                start_time = best_eval['st'][j, s]
+                end_time = best_eval['ct'][j, s]
+                machine = best_solution[(best_solution[:, 0] == (j+1)) & (best_solution[:, 1] == (s+1))][0, 2]
+                data.append([s+1, int(start_time), int(end_time), machine])
+        return data
+
+    left_jobs = list(range(0, min(5, no_of_jobs)))
+    right_jobs = list(range(min(5, no_of_jobs), no_of_jobs))
+    
+    table_data_left = build_job_table_data(left_jobs)
+    table_data_right = build_job_table_data(right_jobs)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    ax1.axis('tight')
+    ax1.axis('off')
+    ax1.table(cellText=table_data_left, cellLoc='center', loc='center')
+    ax2.axis('tight')
+    ax2.axis('off')
+    ax2.table(cellText=table_data_right, cellLoc='center', loc='center')
+    fig.suptitle("Job Scheduling Table", fontsize=16)
+    fig.tight_layout()
+    
+    table_window = tk.Toplevel(window)
+    table_window.title("Final Scheduling Table")
+    canvas = FigureCanvasTkAgg(fig, master=table_window)
+    canvas.draw()
+    widget = canvas.get_tk_widget()
+    widget.pack()
+
+def display_final_machine_schedule_table(search_result):
+    machine_all = search_result['machine_all']
+    st_all = search_result['st_all']
+    ct_all = search_result['ct_all']
+    best_iter = search_result['best_iter']
+    
+    def build_machine_table_data(machine_indices):
+        data = []
+        for m in machine_indices:
+            tasks_on_m = []
+            for j in range(no_of_jobs):
+                for s in range(no_of_steps):
+                    if machine_all[best_iter, j, s] == m:
+                        start_t = st_all[best_iter, j, s]
+                        end_t = ct_all[best_iter, j, s]
+                        tasks_on_m.append((start_t, end_t, j+1, s+1))
+            tasks_on_m.sort(key=lambda x: x[0])
+            data.append([f"(Machine #{m})", "", "", "", ""])
+            data.append(["Sequence", "Start Time", "End Time", "Job #", "Operation #"])
+            seq = 1
+            for (start_t, end_t, job_id, op_id) in tasks_on_m:
+                data.append([seq, int(start_t), int(end_t), job_id, op_id])
+                seq += 1
+        return data
+
+    mid = no_of_machines // 2
+    left_machines = list(range(1, mid+1))
+    right_machines = list(range(mid+1, no_of_machines+1))
+    
+    table_data_left = build_machine_table_data(left_machines)
+    table_data_right = build_machine_table_data(right_machines)
+    
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    ax1.axis('tight')
+    ax1.axis('off')
+    ax1.table(cellText=table_data_left, cellLoc='center', loc='center')
+    ax2.axis('tight')
+    ax2.axis('off')
+    ax2.table(cellText=table_data_right, cellLoc='center', loc='center')
+    fig.suptitle("Machine Scheduling Table", fontsize=16)
+    fig.tight_layout()
+    
+    machine_window = tk.Toplevel(window)
+    machine_window.title("Final Machine Scheduling Table")
+    canvas = FigureCanvasTkAgg(fig, master=machine_window)
+    canvas.draw()
+    widget = canvas.get_tk_widget()
+    widget.pack()
+
+def export_schedules_to_excel(search_result, filename="schedules.xlsx"):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, Border, Side
+    wb = Workbook()
+    ws_job = wb.active
+    ws_job.title = "Job Scheduling Table"
+    ws_machine = wb.create_sheet(title="Machine Scheduling Table")
+    
+    thin_border = Border(left=Side(style='thin'),
+                         right=Side(style='thin'),
+                         top=Side(style='thin'),
+                         bottom=Side(style='thin'))
+    
+    best_solution = search_result['best_solution']
+    best_eval = search_result['best_eval']
+    
+    def build_job_table_data(job_indices):
+        data = []
+        for j in job_indices:
+            data.append([f"Job #{j+1}", "", "", ""])
+            data.append(["Operation #", "Start Time", "End Time", "Machine #"])
+            for s in range(no_of_steps):
+                start_time = best_eval['st'][j, s]
+                end_time = best_eval['ct'][j, s]
+                machine = best_solution[(best_solution[:, 0] == (j+1)) & (best_solution[:, 1] == (s+1))][0, 2]
+                data.append([s+1, int(start_time), int(end_time), machine])
+        return data
+    
+    left_jobs = list(range(0, min(5, no_of_jobs)))
+    right_jobs = list(range(min(5, no_of_jobs), no_of_jobs))
+    
+    table_data_left = build_job_table_data(left_jobs)
+    table_data_right = build_job_table_data(right_jobs)
+    
+    max_cols_left = 4
+    max_cols_right = 4
+    total_cols = max_cols_left + max_cols_right + 2 
+    ws_job.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+    ws_job.cell(row=1, column=1, value="Job Scheduling Table").font = Font(bold=True, size=14)
+    ws_job.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    
+    start_row = 3
+    for i, row_data in enumerate(table_data_left):
+        for j, value in enumerate(row_data):
+            cell = ws_job.cell(row=start_row + i, column=1 + j, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+            
+    start_col_right = max_cols_left + 3
+    for i, row_data in enumerate(table_data_right):
+        for j, value in enumerate(row_data):
+            cell = ws_job.cell(row=start_row + i, column=start_col_right + j, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+    machine_all = search_result['machine_all']
+    st_all = search_result['st_all']
+    ct_all = search_result['ct_all']
+    best_iter = search_result['best_iter']
+    
+    def build_machine_table_data(machine_indices):
+        data = []
+        for m in machine_indices:
+            tasks_on_m = []
+            for j in range(no_of_jobs):
+                for s in range(no_of_steps):
+                    if machine_all[best_iter, j, s] == m:
+                        start_t = st_all[best_iter, j, s]
+                        end_t = ct_all[best_iter, j, s]
+                        tasks_on_m.append((start_t, end_t, j+1, s+1))
+            tasks_on_m.sort(key=lambda x: x[0])
+            data.append([f"(Machine #{m})", "", "", "", ""])
+            data.append(["Sequence", "Start Time", "End Time", "Job #", "Operation #"])
+            seq = 1
+            for (start_t, end_t, job_id, op_id) in tasks_on_m:
+                data.append([seq, int(start_t), int(end_t), job_id, op_id])
+                seq += 1
+        return data
+    
+    mid = no_of_machines // 2
+    left_machines = list(range(1, mid+1))
+    right_machines = list(range(mid+1, no_of_machines+1))
+    
+    table_data_left_m = build_machine_table_data(left_machines)
+    table_data_right_m = build_machine_table_data(right_machines)
+    
+    max_cols_left_m = 5
+    max_cols_right_m = 5
+    total_cols_m = max_cols_left_m + max_cols_right_m + 2
+    ws_machine.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols_m)
+    ws_machine.cell(row=1, column=1, value="Machine Scheduling Table").font = Font(bold=True, size=14)
+    ws_machine.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    
+    for i, row_data in enumerate(table_data_left_m):
+        for j, value in enumerate(row_data):
+            cell = ws_machine.cell(row=3 + i, column=1 + j, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+            
+    start_col_right_m = max_cols_left_m + 3
+    for i, row_data in enumerate(table_data_right_m):
+        for j, value in enumerate(row_data):
+            cell = ws_machine.cell(row=3 + i, column=start_col_right_m + j, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+    wb.save(filename)
+
+def process_input(event=None):
+    global user_constraints, job_order_constraints
+
+    user_input = text_input.get("1.0", "end-1c")
+    user_input_lower = user_input.lower()
+
+    uc_matches = re.findall(
+        r'operation\s*#\s*(\d+).*?job\s*#\s*(\d+).*?machine\s*#\s*(\d+)',
+        user_input, flags=re.IGNORECASE
+    )
+    if uc_matches:
+        user_constraints = [(int(m[1]), int(m[0]), int(m[2])) for m in uc_matches]
+    else:
+        user_constraints = []
+
+    pair_regex = re.compile(
+        r'job\s*#\s*(\d+)'        
+        r'[\s\S]*?'               
+        r'\b(earlier|later)\b'     
+        r'[\s\S]*?than[\s\S]*?'    
+        r'job\s*#\s*(\d+)',       
+        flags=re.IGNORECASE
+    )
+    pair_matches = pair_regex.findall(user_input)
+    job_order_constraints = []
+    for a, rel, b in pair_matches:
+        job_order_constraints.append((int(a), rel, int(b)))
+
+    global_regex = re.compile(
+        r'job\s*#\s*(\d+)'
+        r'[\s\S]*?(earlier|later)[\s\S]*?than[\s\S]*(all|other)',
+        flags=re.IGNORECASE
+    )
+    global_matches = global_regex.findall(user_input)
+    for m in global_matches:
+        job_a, relation = int(m[0]), m[1]
+        for job_b in range(1, no_of_jobs + 1):
+            if job_b != job_a:
+                job_order_constraints.append((job_a, relation, job_b))
+
+    search_result = run_tabu_search()
+    best_obj     = search_result['best_obj']
+    tardiness    = search_result['tardiness']
+    max_lateness = search_result['max_lateness']
+
+    result_message = ""
+    if any(kw in user_input_lower for kw in ["min cmax", "minimize the makespan", "minimize makespan"]):
+        result_message += f'FJ{no_of_machines}/rj/(Cmax)\nMin Cmax = {best_obj}\n'
+    if any(kw in user_input_lower for kw in ["max lateness", "max_lateness"]):
+        result_message += f"Max_Lateness = {max_lateness}\n"
+    if any(kw in user_input_lower for kw in ["total tardiness", "total_tardiness"]):
+        result_message += f"Total_Tardiness = {tardiness}\n"
+
+    if result_message:
+        show_results(result_message, search_result)
+        display_final_schedule_table(search_result)
+        display_final_machine_schedule_table(search_result)
+        export_schedules_to_excel(search_result)
+        messagebox.showinfo("Export Successful", "排程表已匯出為 Excel 檔案")
+    else:
+        messagebox.showerror("Error", "請輸入有效的關鍵字")
+
+
+def on_return(event):
+
+    current_line = text_input.get("insert linestart", "insert")
+    if current_line.strip() == "":
+        process_input()
+        return "break"
+    else:
+        text_input.insert("insert", "\n")
+        return "break"
+
+window = tk.Tk()
+window.title("User Interface")
+window.geometry("600x400")
+
+label = tk.Label(window,
+                 text="GenAI Job Scheduling System ",
+                 font=("Arial", 14, "bold"),
+                 fg="blue",
+                 anchor="w")
+label.pack(fill="x", padx=10, pady=(15, 10))
+
+label_1 = tk.Label(window,
+                   text="Input your scheduling requirements :",
+                   font=("Arial", 11, "bold"))
+label_1.pack(pady=(15, 10))
+
+text_input = tk.Text(window, height=10, width=70, font=("Arial", 11))
+text_input.pack(padx=15, pady=10)
+
+text_input.bind("<Return>", on_return)
+
+process_button = tk.Button(window,
+                           text="Generate Scheduling",
+                           font=("Arial", 11, "bold"),
+                           fg="purple",
+                           command=process_input)
+process_button.pack(pady=(20, 15))
+
+window.mainloop()
